@@ -2,6 +2,7 @@ import enum
 import math
 import warnings
 from typing import Callable, Dict, List, Optional, Tuple, Union, cast
+import copy
 
 import torch
 import torch.nn.functional as F
@@ -169,7 +170,7 @@ class _TokenInitialization(enum.Enum):
         d_sqrt_inv = 1 / math.sqrt(d)
         if self == _TokenInitialization.UNIFORM:
             # used in the paper "Revisiting Deep Learning Models for Tabular Data";
-            # is equivalent to `nn.init.kaiming_uniform_(x, a=math.sqrt(5))` (which is
+            # is equivalent to `nn.init.kaiming_uniform_(x, a=math.sqrt(5   ))` (which is
             # used by torch to initialize nn.Linear.weight, for example)
             nn.init.uniform_(x, a=-d_sqrt_inv, b=d_sqrt_inv)
         elif self == _TokenInitialization.NORMAL:
@@ -231,6 +232,8 @@ class MultiheadAttention(nn.Module):
         self.W_out = nn.Linear(d_token, d_token, bias) if n_heads > 1 else None
         self.n_heads = n_heads
         self.dropout = nn.Dropout(dropout) if dropout else None
+        self.attn = None
+        self.attn_gradients = None
 
         for m in [self.W_q, self.W_k, self.W_v]:
             # the "xavier" branch tries to follow torch.nn.MultiheadAttention;
@@ -253,6 +256,18 @@ class MultiheadAttention(nn.Module):
             .transpose(1, 2)
             .reshape(batch_size * self.n_heads, n_tokens, d_head)
         )
+
+    def save_attn(self, attn):
+        self.attn = attn
+    
+    def save_attn_gradients(self, attn_gradients):
+        self.attn_gradients = attn_gradients
+
+    def get_attn(self):
+        return self.attn
+
+    def get_attn_gradients(self):
+        return self.attn_gradients
 
     def forward(
         self,
@@ -297,6 +312,11 @@ class MultiheadAttention(nn.Module):
         k = self._reshape(k)
         attention_logits = q @ k.transpose(1, 2) / math.sqrt(d_head_key)
         attention_probs = F.softmax(attention_logits, dim=-1)
+
+        self.save_attn(attention_probs)
+        if attention_probs.requires_grad:
+            attention_probs.register_hook(self.save_attn_gradients)
+        
         if self.dropout is not None:
             attention_probs = self.dropout(attention_probs)
         x = attention_probs @ self._reshape(v)
@@ -307,10 +327,7 @@ class MultiheadAttention(nn.Module):
         )
         if self.W_out is not None:
             x = self.W_out(x)
-        return x, {
-            "attention_logits": attention_logits,
-            "attention_probs": attention_probs,
-        }
+        return x
 
 
 class AdditiveAttention(nn.Module):
@@ -561,7 +578,8 @@ class FT_Transformer(nn.Module):
         self,
         *,
         d_token: int,
-        n_blocks: int,
+        n_self_blocks: int,
+        n_cross_blocks: int,
         attention_n_heads: int,
         attention_dropout: float,
         attention_initialization: str,
@@ -586,14 +604,17 @@ class FT_Transformer(nn.Module):
         row_attention: Optional[bool] = False,
         row_attention_layer: Optional[str] = None,
         global_token: Optional[bool] = False,
+        cross_attention: Optional[bool] = False,
     ) -> None:
         """
         Parameters
         ----------
         d_token
             The size of one token for `_CategoricalFeatureTokenizer`.
-        n_blocks
-            Number of the `FT_Transformer` blocks, which should be non-negative.
+        n_self_blocks
+            Number of the `FT_Transformer` self-attention blocks, which should be non-negative.
+        n_cross_blocks
+            Number of the `FT_Transformer` cross-attention blocks, which should be non-negative if `cross_attention` is True.
         attention_n_heads
             Number of attention heads in each `FT_Transformer` block, which should be positive.
         attention_dropout
@@ -634,6 +655,12 @@ class FT_Transformer(nn.Module):
             if 'true', then value and query transformation parameters are shared in additive attention.
         """
         super().__init__()
+        assert n_self_blocks > 0, "n_self_blocks must be positive"
+        self.n_self_blocks = n_self_blocks
+        self.batch_size = None
+        if cross_attention:
+            assert n_cross_blocks > 0
+            self.n_cross_blocks = n_cross_blocks
         if row_attention:
             row_attention_layer = row_attention_layer if row_attention_layer else "last"
         else:
@@ -691,6 +718,7 @@ class FT_Transformer(nn.Module):
         self.row_attention = row_attention
         self.row_attention_layer = row_attention_layer
         self.global_token = global_token
+        self.cross_attention = cross_attention
 
         self.blocks = nn.ModuleList([])
         if self.row_attention:
@@ -719,58 +747,19 @@ class FT_Transformer(nn.Module):
             # for p in self.row_attention_layers.parameters():
             #     nn.init.zeros_(p)
 
-        for layer_idx in range(n_blocks):
-            layer = nn.ModuleDict(
-                {
-                    "attention": AdditiveAttention(
-                        d_token=d_token,
-                        n_heads=attention_n_heads,
-                        dropout=attention_dropout,
-                        bias=True,
-                        share_qv_weights=share_qv_weights,
-                        initialization=attention_initialization,
-                    )
-                    if additive_attention
-                    else MultiheadAttention(
-                        d_token=d_token,
-                        n_heads=attention_n_heads,
-                        dropout=attention_dropout,
-                        bias=True,
-                        initialization=attention_initialization,
-                    ),
-                    "ffn": FT_Transformer.FFN(
-                        d_token=d_token,
-                        d_hidden=ffn_d_hidden,
-                        bias_first=True,
-                        bias_second=True,
-                        dropout=ffn_dropout,
-                        activation=ffn_activation,
-                    ),
-                    "attention_residual_dropout": nn.Dropout(residual_dropout),
-                    "ffn_residual_dropout": nn.Dropout(residual_dropout),
-                    "output": nn.Identity(),  # for hooks-based introspection
-                }
-            )
-            if layer_idx or not prenormalization or first_prenormalization:
-                layer["attention_normalization"] = _make_nn_module(attention_normalization, d_token)
-            layer["ffn_normalization"] = _make_nn_module(ffn_normalization, d_token)
-            if kv_compression_ratio and self.shared_kv_compression is None:
-                layer["key_compression"] = make_kv_compression()
-                if kv_compression_sharing == "headwise":
-                    layer["value_compression"] = make_kv_compression()
-                else:
-                    assert kv_compression_sharing == "key-value", _INTERNAL_ERROR_MESSAGE
-            if row_attention:
-                self.row_attention_layers = nn.ModuleDict(
+        if self.cross_attention:
+            for layer_idx in range(self.n_self_blocks):
+                layer = nn.ModuleDict(
                     {
-                        "row_attention": MultiheadAttention(
+                        "attention": MultiheadAttention(
                             d_token=d_token,
                             n_heads=attention_n_heads,
                             dropout=attention_dropout,
                             bias=True,
                             initialization=attention_initialization,
                         ),
-                        "row_ffn": FT_Transformer.FFN(
+                        "attention_residual_dropout": nn.Dropout(residual_dropout),
+                        "ffn": FT_Transformer.FFN(
                             d_token=d_token,
                             d_hidden=ffn_d_hidden,
                             bias_first=True,
@@ -778,15 +767,198 @@ class FT_Transformer(nn.Module):
                             dropout=ffn_dropout,
                             activation=ffn_activation,
                         ),
-                        "row_attention_residual_dropout": nn.Dropout(residual_dropout),
-                        "row_ffn_residual_dropout": nn.Dropout(residual_dropout),
-                        "row_output": nn.Identity(),  # for hooks-based introspection
+                        "ffn_residual_dropout": nn.Dropout(residual_dropout),
+                        "ts_attention": MultiheadAttention(
+                            d_token=d_token,
+                            n_heads=attention_n_heads,
+                            dropout=attention_dropout,
+                            bias=True,
+                            initialization=attention_initialization,
+                        ),
+                        "ts_attention_residual_dropout": nn.Dropout(residual_dropout),
+                        "ts_ffn": FT_Transformer.FFN(
+                            d_token=d_token,
+                            d_hidden=ffn_d_hidden,
+                            bias_first=True,
+                            bias_second=True,
+                            dropout=ffn_dropout,
+                            activation=ffn_activation,
+                        ),
+                        "ts_ffn_residual_dropout": nn.Dropout(residual_dropout),
+                        "output": nn.Identity(),  # for hooks-based introspection
                     }
                 )
-                # for p in self.row_attention_layers.parameters():
-                #     nn.init.zeros_(p)
-                layer.update(self.row_attention_layers)
-            self.blocks.append(layer)
+
+                if layer_idx or not prenormalization or first_prenormalization:
+                    layer["attention_normalization"] = _make_nn_module(attention_normalization, d_token)
+                layer["ffn_normalization"] = _make_nn_module(ffn_normalization, d_token)
+                if kv_compression_ratio and self.shared_kv_compression is None:
+                    layer["key_compression"] = make_kv_compression()
+                    if kv_compression_sharing == "headwise":
+                        layer["value_compression"] = make_kv_compression()
+                    else:
+                        assert kv_compression_sharing == "key-value", _INTERNAL_ERROR_MESSAGE
+                
+                self.blocks.append(layer)
+
+            for layer_idx in range(n_cross_blocks):
+                layer = nn.ModuleDict(
+                    {
+                        "cross_attention_tabimg": MultiheadAttention(
+                            d_token=d_token,
+                            n_heads=attention_n_heads,
+                            dropout=attention_dropout,
+                            bias=True,
+                            initialization=attention_initialization,
+                        ),
+                        "cross_attention_tabimg_residual_dropout": nn.Dropout(residual_dropout),
+                        "cross_attention_ffn_tabimg": FT_Transformer.FFN(
+                            d_token=d_token,
+                            d_hidden=ffn_d_hidden,
+                            bias_first=True,
+                            bias_second=True,
+                            dropout=ffn_dropout,
+                            activation=ffn_activation,
+                        ),
+                        "cross_attention_ffn_tabimg_residual_dropout": nn.Dropout(residual_dropout),
+                        "cross_attention_imgtab": MultiheadAttention(
+                            d_token=d_token,
+                            n_heads=attention_n_heads,
+                            dropout=attention_dropout,
+                            bias=True,
+                            initialization=attention_initialization,
+                        ),
+                        "cross_attention_imgtab_residual_dropout": nn.Dropout(residual_dropout),
+                        "cross_attention_ffn_imgtab": FT_Transformer.FFN(
+                            d_token=d_token,
+                            d_hidden=ffn_d_hidden,
+                            bias_first=True,
+                            bias_second=True,
+                            dropout=ffn_dropout,
+                            activation=ffn_activation,
+                        ),
+                        "cross_attention_ffn_imgtab_residual_dropout": nn.Dropout(residual_dropout),
+                        "self_attention_tabtab": MultiheadAttention(
+                            d_token=d_token,
+                            n_heads=attention_n_heads,
+                            dropout=attention_dropout,
+                            bias=True,
+                            initialization=attention_initialization,
+                        ),
+                        "self_attention_tabtab_residual_dropout": nn.Dropout(residual_dropout),
+                        "self_attention_ffn_tabtab": FT_Transformer.FFN(
+                            d_token=d_token,
+                            d_hidden=ffn_d_hidden,
+                            bias_first=True,
+                            bias_second=True,
+                            dropout=ffn_dropout,
+                            activation=ffn_activation,
+                        ),
+                        "self_attention_ffn_tabtab_residual_dropout": nn.Dropout(residual_dropout),
+                        "self_attention_imgimg": MultiheadAttention(
+                            d_token=d_token,
+                            n_heads=attention_n_heads,
+                            dropout=attention_dropout,
+                            bias=True,
+                            initialization=attention_initialization,
+                        ),
+                        "self_attention_imgimg_residual_dropout": nn.Dropout(residual_dropout),
+                        "self_attention_ffn_imgimg": FT_Transformer.FFN(
+                            d_token=d_token,
+                            d_hidden=ffn_d_hidden,
+                            bias_first=True,
+                            bias_second=True,
+                            dropout=ffn_dropout,
+                            activation=ffn_activation,
+                        ),
+                        "self_attention_ffn_imgimg_residual_dropout": nn.Dropout(residual_dropout),
+                        "cross_output": nn.Identity(),  # for hooks-based introspection
+                    }
+                )
+                if layer_idx or not prenormalization or first_prenormalization:
+                    layer["cross_attention_tabimg_normalization"] = _make_nn_module(attention_normalization, d_token)
+                    layer["cross_attention_imgtab_normalization"] = _make_nn_module(attention_normalization, d_token)
+                    layer["self_attention_tabtab_normalization"] = _make_nn_module(attention_normalization, d_token)
+                    layer["self_attention_imgimg_normalization"] = _make_nn_module(attention_normalization, d_token)
+                layer["cross_attention_ffn_tabimg_normalization"] = _make_nn_module(ffn_normalization, d_token)
+                layer["cross_attention_ffn_imgtab_normalization"] = _make_nn_module(ffn_normalization, d_token)
+                layer["self_attention_ffn_tabtab_normalization"] = _make_nn_module(ffn_normalization, d_token)
+                layer["self_attention_ffn_imgimg_normalization"] = _make_nn_module(ffn_normalization, d_token)
+                                
+                self.blocks.append(layer)
+
+
+        else:
+            for layer_idx in range(n_self_blocks):
+                layer = nn.ModuleDict(
+                    {
+                        "attention": AdditiveAttention(
+                            d_token=d_token,
+                            n_heads=attention_n_heads,
+                            dropout=attention_dropout,
+                            bias=True,
+                            share_qv_weights=share_qv_weights,
+                            initialization=attention_initialization,
+                        )
+                        if additive_attention
+                        else MultiheadAttention(
+                            d_token=d_token,
+                            n_heads=attention_n_heads,
+                            dropout=attention_dropout,
+                            bias=True,
+                            initialization=attention_initialization,
+                        ),
+                        "ffn": FT_Transformer.FFN(
+                            d_token=d_token,
+                            d_hidden=ffn_d_hidden,
+                            bias_first=True,
+                            bias_second=True,
+                            dropout=ffn_dropout,
+                            activation=ffn_activation,
+                        ),
+                        "attention_residual_dropout": nn.Dropout(residual_dropout),
+                        "ffn_residual_dropout": nn.Dropout(residual_dropout),
+                        "output": nn.Identity(),  # for hooks-based introspection
+                    }
+                )
+
+                if layer_idx or not prenormalization or first_prenormalization:
+                    layer["attention_normalization"] = _make_nn_module(attention_normalization, d_token)
+                layer["ffn_normalization"] = _make_nn_module(ffn_normalization, d_token)
+                if kv_compression_ratio and self.shared_kv_compression is None:
+                    layer["key_compression"] = make_kv_compression()
+                    if kv_compression_sharing == "headwise":
+                        layer["value_compression"] = make_kv_compression()
+                    else:
+                        assert kv_compression_sharing == "key-value", _INTERNAL_ERROR_MESSAGE
+                if row_attention:
+                    self.row_attention_layers = nn.ModuleDict(
+                        {
+                            "row_attention": MultiheadAttention(
+                                d_token=d_token,
+                                n_heads=attention_n_heads,
+                                dropout=attention_dropout,
+                                bias=True,
+                                initialization=attention_initialization,
+                            ),
+                            "row_ffn": FT_Transformer.FFN(
+                                d_token=d_token,
+                                d_hidden=ffn_d_hidden,
+                                bias_first=True,
+                                bias_second=True,
+                                dropout=ffn_dropout,
+                                activation=ffn_activation,
+                            ),
+                            "row_attention_residual_dropout": nn.Dropout(residual_dropout),
+                            "row_ffn_residual_dropout": nn.Dropout(residual_dropout),
+                            "row_output": nn.Identity(),  # for hooks-based introspection
+                        }
+                    )
+                    # for p in self.row_attention_layers.parameters():
+                    #     nn.init.zeros_(p)
+                    layer.update(self.row_attention_layers)
+                
+                self.blocks.append(layer)
 
         self.head = (
             FT_Transformer.Head(
@@ -811,8 +983,19 @@ class FT_Transformer(nn.Module):
             else (None, None)
         )
 
-    def _start_residual(self, layer, stage, x):
-        if not self.row_attention:
+    def _start_residual(self, layer, stage, x, cross_attention=False):
+        if cross_attention:
+            assert stage in ["cross_attention_tabimg",
+            "cross_attention_imgtab",
+            "cross_attention_ffn_tabimg",
+            "cross_attention_ffn_imgtab",
+            "self_attention_tabtab",
+            "self_attention_imgimg",
+            "self_attention_ffn_imgimg",
+            "self_attention_ffn_tabtab"], _INTERNAL_ERROR_MESSAGE
+        elif self.cross_attention:
+            assert stage in ["attention", "ffn", "ts_attention", "ts_ffn"], _INTERNAL_ERROR_MESSAGE
+        elif not self.row_attention:
             assert stage in ["attention", "ffn"], _INTERNAL_ERROR_MESSAGE
         else:
             assert stage in ["attention", "ffn", "row_attention", "row_ffn"], _INTERNAL_ERROR_MESSAGE
@@ -823,8 +1006,19 @@ class FT_Transformer(nn.Module):
                 x_residual = layer[norm_key](x_residual)
         return x_residual
 
-    def _end_residual(self, layer, stage, x, x_residual):
-        if not self.row_attention:
+    def _end_residual(self, layer, stage, x, x_residual, cross_attention=False):
+        if cross_attention:
+            assert stage in ["cross_attention_tabimg",
+            "cross_attention_imgtab",
+            "cross_attention_ffn_tabimg",
+            "cross_attention_ffn_imgtab",
+            "self_attention_tabtab",
+            "self_attention_imgimg",
+            "self_attention_ffn_imgimg",
+            "self_attention_ffn_tabtab"], _INTERNAL_ERROR_MESSAGE
+        elif self.cross_attention:
+            assert stage in ["attention", "ffn", "ts_attention", "ts_ffn"], _INTERNAL_ERROR_MESSAGE
+        elif not self.row_attention:
             assert stage in ["attention", "ffn"], _INTERNAL_ERROR_MESSAGE
         else:
             assert stage in ["attention", "ffn", "row_attention", "row_ffn"], _INTERNAL_ERROR_MESSAGE
@@ -847,68 +1041,177 @@ class FT_Transformer(nn.Module):
             x = x[:, 1:]
         return x
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x_context: Optional[Tensor] = None) -> Tensor:
         assert x.ndim == 3, "The input must have 3 dimensions: (n_objects, n_tokens, d_token)"
+
+        self.batch_size = x.shape[0]
+        
         for layer_idx, layer in enumerate(self.blocks):
             layer = cast(nn.ModuleDict, layer)
 
-            if self.row_attention_layer == "first" and layer_idx == 0:
-                x = torch.transpose(x, 0, 1)
+            if self.cross_attention:
+                if x_context is None:
+                    raise ValueError("x_context must be provided for cross-attention")
+                if layer_idx in list(range(self.n_self_blocks)):
+                    x = self._start_global_token(x)
+                    x_residual = self._start_residual(layer, "attention", x)
+                    x_residual = layer["attention"](
+                        x_residual,
+                        x_residual,
+                        None,
+                        None,
+                    )
+                    x = self._end_residual(layer, "attention", x, x_residual)
+                    x_residual = self._start_residual(layer, "ffn", x)
+                    x_residual = layer["ffn"](x_residual)
+                    x = self._end_residual(layer, "ffn", x, x_residual)
+                    x = layer["output"](x)
+                    x = self._end_global_token(x)
+
+                    x_context = self._start_global_token(x_context)
+                    x_residual = self._start_residual(layer, "ts_attention", x_context)
+                    x_residual = layer["ts_attention"](
+                        x_residual,
+                        x_residual,
+                        None,
+                        None,
+                    )
+                    x_context = self._end_residual(layer, "ts_attention", x_context, x_residual)
+                    x_residual = self._start_residual(layer, "ts_ffn", x_context)
+                    x_residual = layer["ts_ffn"](x_residual)
+                    x_context = self._end_residual(layer, "ts_ffn", x_context, x_residual)
+                    x_context = layer["output"](x_context)
+                    x_context = self._end_global_token(x_context)
+                                 
+                if layer_idx in list(range(self.n_self_blocks, self.n_self_blocks + self.n_cross_blocks)): 
+                    x = x_ctx_img = self._start_global_token(x)
+                    x_context = self._start_global_token(x_context)     
+                    x_residual = self._start_residual(layer, "cross_attention_tabimg", x, cross_attention=True)
+                    x_residual = layer["cross_attention_tabimg"](
+                        x_residual,
+                        x_context,
+                        None,
+                        None,
+                    )
+                    x = self._end_residual(layer, "cross_attention_tabimg", x, x_residual, cross_attention=True)
+                    x_residual = self._start_residual(layer, "cross_attention_ffn_tabimg", x, cross_attention=True)
+                    x_residual = layer["cross_attention_ffn_tabimg"](x_residual)
+                    x = self._end_residual(layer, "cross_attention_ffn_tabimg", x, x_residual, cross_attention=True)
+                    # x = layer["cross_attention_tabimg_normalization"](x)
+                    x_residual = self._start_residual(layer, "self_attention_tabtab", x, cross_attention=True)
+                    x_residual = layer["self_attention_tabtab"](
+                        x_residual,
+                        x_residual,
+                        None,
+                        None,
+                    )
+                    x = self._end_residual(layer, "self_attention_tabtab", x, x_residual, cross_attention=True)
+                    x_residual = self._start_residual(layer, "self_attention_ffn_tabtab", x, cross_attention=True)
+                    x_residual = layer["self_attention_ffn_tabtab"](x_residual)
+                    x = self._end_residual(layer, "self_attention_ffn_tabtab", x, x_residual, cross_attention=True)
+
+                    x_residual = self._start_residual(layer, "cross_attention_imgtab", x_context, cross_attention=True)
+                    x_residual = layer["cross_attention_imgtab"](
+                        x_residual,
+                        x_ctx_img,
+                        None,
+                        None,
+                    )
+                    x_context = self._end_residual(layer, "cross_attention_imgtab", x_context, x_residual, cross_attention=True)
+                    x_residual = self._start_residual(layer, "cross_attention_ffn_imgtab", x_context, cross_attention=True)
+                    x_residual = layer["cross_attention_ffn_imgtab"](x_residual)
+                    x_context = self._end_residual(layer, "cross_attention_ffn_imgtab", x_context, x_residual, cross_attention=True)
+                    # x_context = layer["cross_attention_imgtab_normalization"](x_context)
+                    x_residual = self._start_residual(layer, "self_attention_imgimg", x_context, cross_attention=True)
+                    x_residual = layer["self_attention_imgimg"](
+                        x_residual,
+                        x_residual,
+                        None,
+                        None,
+                    )
+                    x_context = self._end_residual(layer, "self_attention_imgimg", x_context, x_residual, cross_attention=True)
+                    x_residual = self._start_residual(layer, "self_attention_ffn_imgimg", x_context, cross_attention=True)
+                    x_residual = layer["self_attention_ffn_imgimg"](x_residual)
+                    x_context = self._end_residual(layer, "self_attention_ffn_imgimg", x_context, x_residual, cross_attention=True)
+
+                    # if layer_idx == self.n_cross_blocks - 1:
+                    #     x = torch.cat([x, x_context], dim=1)
+                    #     x = layer["cross_output"](x)
+                    # else:
+                    #     x = x_tab
+                    #     x_context = x_ts
+
+                    x = self._end_global_token(x)
+                    x_context = self._end_global_token(x_context)
+
+                if layer_idx == self.n_self_blocks + self.n_cross_blocks - 1:
+                    x = torch.cat([x, x_context], dim=1)
+                    x = layer["cross_output"](x)
+
+            else:
+                if self.row_attention_layer == "first" and layer_idx == 0:
+                    x = torch.transpose(x, 0, 1)
+                    x = self._start_global_token(x)
+                    x_residual = self._start_residual(layer, "row_attention", x)
+                    x_residual, _ = layer["row_attention"](
+                        x_residual,
+                        x_residual,
+                        None,
+                        None,
+                    )
+                    x = self._end_residual(layer, "row_attention", x, x_residual)
+                    x_residual = self._start_residual(layer, "row_ffn", x)
+                    x_residual = layer["row_ffn"](x_residual)
+                    x = self._end_residual(layer, "row_ffn", x, x_residual)
+                    x = layer["row_output"](x)
+                    x = self._end_global_token(x)
+                    x = torch.transpose(x, 0, 1)
+
+                query_idx = self.last_layer_query_idx if layer_idx + 1 == len(self.blocks) else None
+
                 x = self._start_global_token(x)
-                x_residual = self._start_residual(layer, "row_attention", x)
-                x_residual, _ = layer["row_attention"](
+                x_residual = self._start_residual(layer, "attention", x)
+                x_residual = layer["attention"](
+                    x_residual if query_idx is None else x_residual[:, query_idx],
                     x_residual,
-                    x_residual,
-                    None,
-                    None,
+                    *self._get_kv_compressions(layer),
                 )
-                x = self._end_residual(layer, "row_attention", x, x_residual)
-                x_residual = self._start_residual(layer, "row_ffn", x)
-                x_residual = layer["row_ffn"](x_residual)
-                x = self._end_residual(layer, "row_ffn", x, x_residual)
-                x = layer["row_output"](x)
+                if query_idx is not None:
+                    x = x[:, query_idx]
+                x = self._end_residual(layer, "attention", x, x_residual)
+
+                x_residual = self._start_residual(layer, "ffn", x)
+                x_residual = layer["ffn"](x_residual)
+                x = self._end_residual(layer, "ffn", x, x_residual)
+                x = layer["output"](x)
                 x = self._end_global_token(x)
-                x = torch.transpose(x, 0, 1)
 
-            query_idx = self.last_layer_query_idx if layer_idx + 1 == len(self.blocks) else None
-
-            x = self._start_global_token(x)
-            x_residual = self._start_residual(layer, "attention", x)
-            x_residual, _ = layer["attention"](
-                x_residual if query_idx is None else x_residual[:, query_idx],
-                x_residual,
-                *self._get_kv_compressions(layer),
-            )
-            if query_idx is not None:
-                x = x[:, query_idx]
-            x = self._end_residual(layer, "attention", x, x_residual)
-
-            x_residual = self._start_residual(layer, "ffn", x)
-            x_residual = layer["ffn"](x_residual)
-            x = self._end_residual(layer, "ffn", x, x_residual)
-            x = layer["output"](x)
-            x = self._end_global_token(x)
-
-            if self.row_attention_layer == "shared" or (
-                self.row_attention_layer == "last" and layer_idx + 1 == len(self.blocks)
-            ):
-                x = torch.transpose(x, 0, 1)
-                x = self._start_global_token(x)
-                x_residual = self._start_residual(layer, "row_attention", x)
-                x_residual, _ = layer["row_attention"](
-                    x_residual,
-                    x_residual,
-                    None,
-                    None,
-                )
-                x = self._end_residual(layer, "row_attention", x, x_residual)
-                x_residual = self._start_residual(layer, "row_ffn", x)
-                x_residual = layer["row_ffn"](x_residual)
-                x = self._end_residual(layer, "row_ffn", x, x_residual)
-                x = layer["row_output"](x)
-                x = self._end_global_token(x)
-                x = torch.transpose(x, 0, 1)
+                if self.row_attention_layer == "shared" or (
+                    self.row_attention_layer == "last" and layer_idx + 1 == len(self.blocks)
+                ):
+                    x = torch.transpose(x, 0, 1)
+                    x = self._start_global_token(x)
+                    x_residual = self._start_residual(layer, "row_attention", x)
+                    x_residual = layer["row_attention"](
+                        x_residual,
+                        x_residual,
+                        None,
+                        None,
+                    )
+                    x = self._end_residual(layer, "row_attention", x, x_residual)
+                    x_residual = self._start_residual(layer, "row_ffn", x)
+                    x_residual = layer["row_ffn"](x_residual)
+                    x = self._end_residual(layer, "row_ffn", x, x_residual)
+                    x = layer["row_output"](x)
+                    x = self._end_global_token(x)
+                    x = torch.transpose(x, 0, 1)
+       
 
         x = self.head(x)
+
+        # mean attention map over attention heads
+        # batch_size = x.shape[0]
+        # attention_tuple = attention_map.split(batch_size, dim=0)
+        # attention_map = torch.stack(attention_tuple, dim=0).mean(dim=0)
 
         return x
