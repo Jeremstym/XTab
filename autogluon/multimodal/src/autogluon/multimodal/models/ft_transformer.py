@@ -655,7 +655,7 @@ class FT_Transformer(nn.Module):
             if 'true', then value and query transformation parameters are shared in additive attention.
         """
         super().__init__()
-        assert n_self_blocks > 0, "n_self_blocks must be positive"
+        assert n_self_blocks > 0 or n_cross_blocks > 0, "At least one of the self- or cross-attention blocks must be present"
         self.n_self_blocks = n_self_blocks
         self.batch_size = None
         if cross_attention:
